@@ -1,0 +1,121 @@
+#Protocol for docking in AutoDock
+
+#Download PDB structure
+#Check structure 
+#Remove anisotropic entries with following command
+grep -v "ANISOU" file.pdb > file_new.pdb
+
+#Add missing residues using PDBfixer (install PDBfixer using Anaconda prompt- https://github.com/openmm/pdbfixer)
+Remove all heterogens (keep only protein)
+Add missing residues/heavy atoms
+save as protein.pdb and check structure
+
+Save ligand as separate file (lig.pdb) (remove anisotropic entries if necessary)
+#Add hydrogens using OpenBabel and convert to pdbqt
+
+#Open AutoDock Tools
+Set working directory
+Load protein structure, add polar hydrogens, kollman charges
+Load lig.pdbqt, set torsions
+Center grid box around cocrystal ligand and save gpf
+Paste AutoGrid and AutoDock executables in working directory and Run AutoGrid
+Save dock.dpf with default parameters and run AutoDock
+Check dock.dlg for cocrystal ligand RMSD- if less than 2 Angstrom use same grid and docking parameters for query compounds
+Load dock.dlg in mgl tools- save best pose as complex.pdbqt
+Open complex.pdbqt in pymol, save as complex.pdb and separate protein.pdb and ligand.pdb
+
+#Protocol for MD simulations in Amber
+#Best docked pose from AudotoDock
+#Remove hydrogens from protein (Leap adds)
+#Add hydrogens to ligand #Save in separate folder
+
+#Switch to node 1 with command "ssh node1"
+
+#Prepare protein and ligand
+pdb4amber protein.pdb > protein_clean.pdb
+pdb4amber lig.pdb > lig_clean.pdb
+antechamber -fi pdb -fo mol2 -i lig_clean.pdb -o lig.mol2 -rn UNL -c bcc -pf y
+parmchk2 -f mol2 -i lig.mol2 -o lig.frcmod
+
+#Leap
+source leaprc.protein.ff14SB
+source leaprc.gaff2
+source leaprc.water.tip3p
+loadamberparams lig.frcmod
+prot=loadpdb protein_clean.pdb
+lig=loadmol2 lig.mol2
+complex=combine{prot lig}
+PBradii= mbondi3
+saveamberparm complex complex_dry.prmtop complex_dry.inpcrd
+saveamberparm prot prot.prmtop prot.inpcrd
+saveamberparm lig lig.prmtop lig.inpcrd
+charge complex
+addions complex Na+ 4
+solvatebox complex TIP3PBOX 
+saveamberparm complex complex.prmtop complex.inpcrd
+savepdb complex complex.pdb
+
+#Minimize with CPU (sander) on getting error with GPU
+
+sander -O -i min.in -o min.out -p complex.prmtop -c complex.inpcrd -r min.ncrst -inf min.mdinfo
+
+#Heating
+
+pmemd.cuda -O -i heat.in -o heat.out -p complex.prmtop -c min.ncrst -r heat.ncrst -x heat.nc -inf heat.mdinfo
+
+#density-equilibration (if error, then run a short density equil with sander on CPU, then move to GPU)
+pmemd.cuda -O -i density.in -o density.out -p complex.prmtop -c heat.ncrst -r density.ncrst -x density.nc -inf density.mdinfo
+
+#Before production MD, check if system is equilibrated (use perl script provided in Amber tutorial (https://ambermd.org/tutorials/advanced/tutorial3/section1.php)
+
+#Run perl script using windows subsystem for linux/ubuntu-
+perl process_mdout.pl heat.out density.out 
+
+#Check if temperature and density have stabilized using xmgrace plot (perl script will generate summary files which can be used for this)
+
+xmgrace summary.TEMP
+xmgrace summary.DENSITY
+xmgrace summary.ETOT
+
+#for backbone rmsd in cpptraj
+cpptraj
+
+#Specify parameter topology file (solvated complex)
+parm complex.prmtop
+
+#specify trajectory input (output of density equilibration)
+trajin density.nc 1 1000 1    (1000= ratio of nst lim, ntp from density.in)
+
+#Give coordinates of solvated complex as reference
+reference complex.inpcrd
+
+#Align solvated complex and density equilbrated output- this will generate a file that can be plotted with xmgrace to check backbone RMSD 
+rms reference out density.rmsd @CA,C,N
+run
+xmgrace density.rmsd
+
+#Once system is equilibrated, proceed with production MD
+
+#production run -job submission using sbatch file
+pmemd.cuda -O -i prod.in -o prod.out -p complex.prmtop -c density.ncrst -r prod.ncrst -x prod.nc -inf prod.mdinfo
+
+#analysis using cpptraj
+cpptraj
+#load the solvated complex parameter topology file
+parm complex.prmtop
+list parm
+#load input coordinate file after production run
+trajin prod.nc
+list trajin
+#load the reference density.lastframe or production.firstframe
+reference density.nc lastframe [last]
+#Calculate RMSD of production run with reference to last density frame and plot
+rms out prod.rmsd @CA,C,N (use ToMember1 if multiple reference structures are loaded)
+run
+xmgrace prod.rmsd
+
+#Carry out MMPB-GB calculations
+
+
+#Carry out MMPB calculations (do not switch nodes)
+MMPBSA.py -O -i mmpbsa.in -o FINAL_RESULTS_MMPBSA.dat -sp complex.prmtop -cp complex_dry.prmtop -rp prot.prmtop -lp lig.prmtop -y *.nc
